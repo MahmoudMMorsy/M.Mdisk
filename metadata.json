@@ -1,0 +1,6 @@
+{
+  "name": "PC-3000 Mobile",
+  "description": "Low-level USB hard drive diagnostics, sector-by-sector scanning, S.M.A.R.T. monitoring, and health testing via USB-OTG and rootless host APIs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

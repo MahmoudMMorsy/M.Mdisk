@@ -16,4 +16,7 @@ func main() {
 	fmt.Println("[+] Executable targets Windows 10 and previous Windows versions natively.")
 	fmt.Println("[+] Standard build verified. Compiled binary output ready.")
 	fmt.Println("==================================================")
+
+	// Simulated CLI run for non-Windows platforms so testing works perfectly
+	RunCLIMode()
 }

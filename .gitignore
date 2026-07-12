@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Windows and Linux build artifacts
+pc3000_windows.exe
+pc3000_windows/pc3000_windows

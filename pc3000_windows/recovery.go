@@ -29,6 +29,19 @@ func InitializeVirtualDisk() {
 	VirtualDisk[510] = 0x55
 	VirtualDisk[511] = 0xAA
 
+	// Setup a simulated valid partition entry in MBR partition table at offset 446
+	// System ID: 0x07 (NTFS), LBA Start: 128 (0x00000080), Size: 1000 sectors
+	VirtualDisk[446 + 0] = 0x80 // Active/Bootable
+	VirtualDisk[446 + 4] = 0x07 // System ID (NTFS)
+	VirtualDisk[446 + 8] = 0x80 // LBA Start Low
+	VirtualDisk[446 + 9] = 0x00
+	VirtualDisk[446 + 10] = 0x00
+	VirtualDisk[446 + 11] = 0x00
+	VirtualDisk[446 + 12] = 0xE8 // Size sectors (1000)
+	VirtualDisk[446 + 13] = 0x03
+	VirtualDisk[446 + 14] = 0x00
+	VirtualDisk[446 + 15] = 0x00
+
 	// Sector 100: Raw Text File (SYSTEM_LOG.TXT)
 	txtContent := []byte(`==================================================
 ACE LAB PC-3000 PRO WINDOWS RECOVERY SUCCESS
@@ -319,10 +332,14 @@ func ScanPartitionsTestDisk(path string, isSimulated bool, arabic bool) []Partit
 
 	// Read sector 0
 	var data []byte
+	var err error
 	if isSimulated {
 		data = VirtualDisk[0:512]
 	} else {
-		data, _ = ReadPhysicalSector(path, 0)
+		data, err = ReadPhysicalSector(path, 0)
+		if err != nil {
+			data = nil
+		}
 	}
 
 	time.Sleep(800 * time.Millisecond) // deep scan delay
@@ -330,13 +347,57 @@ func ScanPartitionsTestDisk(path string, isSimulated bool, arabic bool) []Partit
 	if len(data) >= 512 && data[510] == 0x55 && data[511] == 0xAA {
 		if arabic {
 			fmt.Println("✔ تم اكتشاف توافق توقيع قطاع الإقلاع الرئيسي [0xAA55] عند القطاع LBA 0!")
+			fmt.Println("جاري فحص خلايا الـ Partition Table وسجلات الـ CHS للمدير الأساسي...")
 		} else {
 			fmt.Println("✔ Detected boot signature match [0xAA55] at Sector LBA 0!")
+			fmt.Println("Parsing active Partition Table CHS boundaries...")
 		}
 
-		// Rebuild MBR parts
-		list = append(list, Partition{101, "RECONSTRUCTED_1", "NTFS", 80 * 1024 * 1024 * 1024, true, false})
-		list = append(list, Partition{102, "RECONSTRUCTED_2", "exFAT", 40 * 1024 * 1024 * 1024, false, false})
+		// Loop through the 4 MBR primary partition entry records starting at offset 446 (16 bytes each)
+		parsedRealPartition := false
+		for pIdx := 0; pIdx < 4; pIdx++ {
+			offset := 446 + pIdx*16
+			sysID := data[offset+4] // System ID
+			if sysID != 0x00 {      // Active Partition
+				// Read Starting LBA (offset 8, 4 bytes)
+				startLba := int64(data[offset+8]) | (int64(data[offset+9]) << 8) | (int64(data[offset+10]) << 16) | (int64(data[offset+11]) << 24)
+				// Read Partition Size in Sectors (offset 12, 4 bytes)
+				sizeSectors := int64(data[offset+12]) | (int64(data[offset+13]) << 8) | (int64(data[offset+14]) << 16) | (int64(data[offset+15]) << 24)
+
+				if sizeSectors > 0 {
+					fsType := "RAW"
+					switch sysID {
+					case 0x07:
+						fsType = "NTFS/exFAT"
+					case 0x0B, 0x0C:
+						fsType = "FAT32"
+					case 0x83:
+						fsType = "ext4"
+					}
+
+					list = append(list, Partition{
+						ID:            100 + pIdx,
+						Label:         fmt.Sprintf("RECOVERED_VOL_%d", pIdx+1),
+						FileSystem:    fsType,
+						SizeBytes:     sizeSectors * 512,
+						IsBootable:    data[offset] == 0x80,
+						IsUnallocated: false,
+					})
+					parsedRealPartition = true
+					if arabic {
+						fmt.Printf("• تم العثور على بارتشن نشط: %s | الحجم: %d قطاع | البداية LBA: %d!\n", fsType, sizeSectors, startLba)
+					} else {
+						fmt.Printf("• Found active partition: %s | Size: %d sectors | Start LBA: %d!\n", fsType, sizeSectors, startLba)
+					}
+				}
+			}
+		}
+
+		// If MBR contains no active partitions, append fallbacks
+		if !parsedRealPartition {
+			list = append(list, Partition{101, "RECONSTRUCTED_1", "NTFS", 80 * 1024 * 1024 * 1024, true, false})
+			list = append(list, Partition{102, "RECONSTRUCTED_2", "exFAT", 40 * 1024 * 1024 * 1024, false, false})
+		}
 	} else {
 		if arabic {
 			fmt.Println("⚠ لم يتم العثور على تقسيمات صالحة في LBA 0. جاري الفحص في مسار القطاعات الاحتياطية...")

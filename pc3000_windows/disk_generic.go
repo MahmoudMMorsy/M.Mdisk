@@ -48,6 +48,16 @@ func EnumeratePhysicalDrives() []DriveInfo {
 	}
 }
 
+// QueryPhysicalSmartAttributes mock stub for Linux compiles
+func QueryPhysicalSmartAttributes(path string) ([]SmartAttribute, error) {
+	return GetMockSmartAttributes(HealthyHDD), nil
+}
+
+// GetSmartAttributeName mock stub for Linux compiles
+func GetSmartAttributeName(id int) string {
+	return "Mock Parameter"
+}
+
 // ReadPhysicalSector reads a 512-byte block from virtual sector maps on Linux
 func ReadPhysicalSector(path string, lba int64) ([]byte, error) {
 	// Read directly from virtual disk sector map

@@ -4,7 +4,9 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -25,6 +27,7 @@ type DriveInfo struct {
 	ActiveIssue    string // Failure mode if any
 }
 
+// Win32 DLL loaders
 var (
 	shell32           = syscall.NewLazyDLL("shell32.dll")
 	procIsUserAnAdmin = shell32.NewProc("IsUserAnAdmin")
@@ -36,7 +39,70 @@ func IsAdmin() bool {
 	return ret != 0
 }
 
-// EnumeratePhysicalDrives checks for active PhysicalDrive paths on Windows
+// IOCTL control codes for storage
+const (
+	IOCTL_STORAGE_QUERY_PROPERTY = 0x002d1400 // Storage query property
+	IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+	IOCTL_DISK_GET_DRIVE_LAYOUT_EX   = 0x00070050
+	SMART_GET_VERSION                = 0x00074080
+	SMART_RCV_DRIVE_DATA             = 0x0007c088
+)
+
+// Storage query property structures
+type STORAGE_PROPERTY_QUERY struct {
+	PropertyId int32
+	QueryType  int32
+	AdditionalParameters [1]byte
+}
+
+type STORAGE_DEVICE_DESCRIPTOR struct {
+	Version               uint32
+	Size                  uint32
+	DeviceType            byte
+	DeviceTypeModifier    byte
+	RemovableMedia        bool
+	CommandQueueing       bool
+	VendorIdOffset        uint32
+	ProductIdOffset       uint32
+	ProductRevisionOffset uint32
+	SerialNumberOffset    uint32
+	BusType               uint32
+	RawPropertiesLength   uint32
+	RawDeviceProperties   [512]byte
+}
+
+// SMART structures
+type GETVERSIONOUTPARAMS struct {
+	Version      byte
+	Revision     byte
+	Reserved     byte
+	Map          byte
+	IDEDevMap    uint32
+	Capabilities uint32
+	Reserved2    [4]uint32
+}
+
+type SENDCMDINPARAMS struct {
+	BufferSize  uint32
+	Features    byte
+	SectorCount byte
+	SectorNumber byte
+	CylLow       byte
+	CylHigh      byte
+	DriveHead    byte
+	Command      byte
+	Reserved     [3]byte
+	Reserved2    [4]uint32
+	Buffer       [1]byte
+}
+
+type SENDCMDOUTPARAMS struct {
+	BufferSize  uint32
+	DriverStatus [4]byte
+	Buffer       [512]byte
+}
+
+// EnumeratePhysicalDrives checks for active PhysicalDrive paths and queries their properties natively
 func EnumeratePhysicalDrives() []DriveInfo {
 	var drives []DriveInfo
 
@@ -44,7 +110,6 @@ func EnumeratePhysicalDrives() []DriveInfo {
 	for i := 0; i < 16; i++ {
 		path := fmt.Sprintf("\\\\.\\PhysicalDrive%d", i)
 
-		// Attempt to open the drive with read-only access to verify existence
 		utfPath, err := syscall.UTF16PtrFromString(path)
 		if err != nil {
 			continue
@@ -52,7 +117,7 @@ func EnumeratePhysicalDrives() []DriveInfo {
 
 		handle, err := syscall.CreateFile(
 			utfPath,
-			syscall.GENERIC_READ,
+			syscall.GENERIC_READ|syscall.GENERIC_WRITE,
 			syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
 			nil,
 			syscall.OPEN_EXISTING,
@@ -60,20 +125,30 @@ func EnumeratePhysicalDrives() []DriveInfo {
 			0,
 		)
 		if err != nil {
-			// Drive does not exist or access denied
-			continue
+			// Try read-only if read-write fails
+			handle, err = syscall.CreateFile(
+				utfPath,
+				syscall.GENERIC_READ,
+				syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+				nil,
+				syscall.OPEN_EXISTING,
+				0,
+				0,
+			)
+			if err != nil {
+				continue
+			}
 		}
 		defer syscall.CloseHandle(handle)
 
-		// Get drive size using IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
+		// 1. Get drive size using IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
 		var sizeBytes int64 = 500107862016 // fallback 500GB
 		var geometry diskGeometryEx
 		var bytesReturned uint32
 
-		ioctlDiskGetDriveGeometryEx := uint32(0x000700A0) // IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
 		err = syscall.DeviceIoControl(
 			handle,
-			ioctlDiskGetDriveGeometryEx,
+			IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
 			nil,
 			0,
 			(*byte)(unsafe.Pointer(&geometry)),
@@ -85,22 +160,227 @@ func EnumeratePhysicalDrives() []DriveInfo {
 			sizeBytes = geometry.DiskSize
 		}
 
+		// 2. Query hardware details using IOCTL_STORAGE_QUERY_PROPERTY
+		var query STORAGE_PROPERTY_QUERY
+		query.PropertyId = 0 // StorageDeviceProperty
+		query.QueryType = 0  // PropertyStandardQuery
+
+		var desc STORAGE_DEVICE_DESCRIPTOR
+		err = syscall.DeviceIoControl(
+			handle,
+			IOCTL_STORAGE_QUERY_PROPERTY,
+			(*byte)(unsafe.Pointer(&query)),
+			uint32(unsafe.Sizeof(query)),
+			(*byte)(unsafe.Pointer(&desc)),
+			uint32(unsafe.Sizeof(desc)),
+			&bytesReturned,
+			nil,
+		)
+
+		vendor := "Generic"
+		model := fmt.Sprintf("Physical Drive %d", i)
+		serial := fmt.Sprintf("HW-DISK-%04d", i)
+		firmware := "HW-REV"
+
+		if err == nil {
+			// Cast strictly to the bounds of the actual descriptor structure to prevent buffer over-read
+			raw := (*[544]byte)(unsafe.Pointer(&desc))
+			if desc.VendorIdOffset > 0 && desc.VendorIdOffset < desc.Size {
+				vendor = getStringAtOffset(raw[:], desc.VendorIdOffset)
+			}
+			if desc.ProductIdOffset > 0 && desc.ProductIdOffset < desc.Size {
+				model = getStringAtOffset(raw[:], desc.ProductIdOffset)
+			}
+			if desc.SerialNumberOffset > 0 && desc.SerialNumberOffset < desc.Size {
+				serial = getStringAtOffset(raw[:], desc.SerialNumberOffset)
+			}
+			if desc.ProductRevisionOffset > 0 && desc.ProductRevisionOffset < desc.Size {
+				firmware = getStringAtOffset(raw[:], desc.ProductRevisionOffset)
+			}
+		}
+
+		busTypeStr := "SATA"
+		if desc.BusType == 11 { // BusTypeNvme
+			busTypeStr = "NVMe"
+		} else if desc.BusType == 7 { // BusTypeUsb
+			busTypeStr = "USB"
+		}
+
 		drives = append(drives, DriveInfo{
 			Index:          i,
 			Path:           path,
-			Vendor:         "Physical",
-			Model:          fmt.Sprintf("Direct Physical Drive %d", i),
-			Firmware:       "WIN-HW",
-			Serial:         fmt.Sprintf("HW-DISK-%04d", i),
+			Vendor:         vendor,
+			Model:          model,
+			Firmware:       firmware,
+			Serial:         serial,
 			CapacityBytes:  sizeBytes,
 			TotalSectors:   sizeBytes / 512,
 			SectorSize:     512,
-			ConnectionType: "SATA/NVMe Direct",
+			ConnectionType: fmt.Sprintf("%s Direct HW Link", busTypeStr),
 			IsSimulated:    false,
 		})
 	}
 
 	return drives
+}
+
+func getStringAtOffset(raw []byte, offset uint32) string {
+	if int(offset) >= len(raw) {
+		return ""
+	}
+	end := bytes.IndexByte(raw[offset:], 0)
+	if end == -1 {
+		return strings.TrimSpace(string(raw[offset:]))
+	}
+	return strings.TrimSpace(string(raw[offset : int(offset)+end]))
+}
+
+// QueryPhysicalSmartAttributes queries actual S.M.A.R.T. registers of a physical drive via Win32 IOCTL
+func QueryPhysicalSmartAttributes(path string) ([]SmartAttribute, error) {
+	var attrs []SmartAttribute
+
+	utfPath, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+
+	handle, err := syscall.CreateFile(
+		utfPath,
+		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		syscall.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open disk for S.M.A.R.T query: %v", err)
+	}
+	defer syscall.CloseHandle(handle)
+
+	// 1. Get S.M.A.R.T version and capabilities
+	var ver GETVERSIONOUTPARAMS
+	var bytesReturned uint32
+	err = syscall.DeviceIoControl(
+		handle,
+		SMART_GET_VERSION,
+		nil,
+		0,
+		(*byte)(unsafe.Pointer(&ver)),
+		uint32(unsafe.Sizeof(ver)),
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("S.M.A.R.T is disabled or unsupported by controller: %v", err)
+	}
+
+	// 2. Build input command parameters to retrieve S.M.A.R.T. attributes
+	var in SENDCMDINPARAMS
+	in.BufferSize = 512
+	in.Command = 0x05 // SMART_CMD
+	in.Features = 0xD0 // SMART_READ_VALUES
+	in.SectorCount = 1
+	in.SectorNumber = 1
+	in.CylLow = 0x4F
+	in.CylHigh = 0xC2
+
+	var out SENDCMDOUTPARAMS
+	err = syscall.DeviceIoControl(
+		handle,
+		SMART_RCV_DRIVE_DATA,
+		(*byte)(unsafe.Pointer(&in)),
+		uint32(unsafe.Sizeof(in)),
+		(*byte)(unsafe.Pointer(&out)),
+		uint32(unsafe.Sizeof(out)),
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve S.M.A.R.T registers: %v", err)
+	}
+
+	// Parse the 512-byte raw data payload
+	// Offset 361 starts the 361-512 attributes array (12 bytes per attribute)
+	raw := out.Buffer[:]
+	for i := 2; i < 362; i += 12 {
+		id := int(raw[i])
+		if id == 0 {
+			continue
+		}
+
+		status := raw[i+1] // flags
+		val := int(raw[i+3])
+		worst := int(raw[i+4])
+
+		// Parse raw value
+		rawValue := int64(raw[i+5]) | (int64(raw[i+6]) << 8) | (int64(raw[i+7]) << 16) | (int64(raw[i+8]) << 24) | (int64(raw[i+9]) << 32) | (int64(raw[i+10]) << 40)
+
+		name := GetSmartAttributeName(id)
+		hexID := fmt.Sprintf("0x%02X", id)
+		rawHex := fmt.Sprintf("0x%012X", rawValue)
+
+		health := StatusOK
+		if val < 20 || (id == 0x05 && rawValue > 10) || (id == 0xC5 && rawValue > 0) {
+			health = StatusCritical
+		} else if val < 50 {
+			health = StatusWarning
+		}
+
+		attrs = append(attrs, SmartAttribute{
+			ID:          id,
+			HexID:       hexID,
+			Name:        name,
+			Value:       val,
+			Worst:       worst,
+			Threshold:   10, // generic threshold fallback
+			RawValue:    rawValue,
+			RawHex:      rawHex,
+			Status:      health,
+			IsCritical:  id == 0x05 || id == 0xC5 || id == 0xC6,
+			Description: fmt.Sprintf("S.M.A.R.T parameter index %s. Status Flags: 0x%02X", hexID, status),
+		})
+	}
+
+	return attrs, nil
+}
+
+// GetSmartAttributeName decodes Win32 S.M.A.R.T parameter names
+func GetSmartAttributeName(id int) string {
+	switch id {
+	case 0x01:
+		return "Raw Read Error Rate"
+	case 0x02:
+		return "Throughput Performance"
+	case 0x03:
+		return "Spin-Up Time"
+	case 0x04:
+		return "Start/Stop Count"
+	case 0x05:
+		return "Reallocated Sectors Count"
+	case 0x07:
+		return "Seek Error Rate"
+	case 0x08:
+		return "Seek Time Performance"
+	case 0x09:
+		return "Power-On Hours"
+	case 0x0A:
+		return "Spin Retry Count"
+	case 0x0C:
+		return "Power Cycle Count"
+	case 0xC2:
+		return "Temperature"
+	case 0xC4:
+		return "Reallocation Event Count"
+	case 0xC5:
+		return "Current Pending Sector Count"
+	case 0xC6:
+		return "Offline Uncorrectable Sector Count"
+	case 0xC7:
+		return "UltraDMA CRC Error Count"
+	default:
+		return fmt.Sprintf("Vendor Specific Parameter (0x%02X)", id)
+	}
 }
 
 // Disk Geometry structures for IOCTL
@@ -135,7 +415,7 @@ func ReadPhysicalSector(path string, lba int64) ([]byte, error) {
 		0,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open physical disk (requires admin rights): %v", err)
+		return nil, fmt.Errorf("failed to open physical disk: %v", err)
 	}
 	defer syscall.CloseHandle(handle)
 

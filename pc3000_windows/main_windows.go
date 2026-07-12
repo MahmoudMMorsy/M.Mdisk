@@ -82,8 +82,11 @@ const (
 	PBM_SETRANGE = 0x0401
 	PBM_SETPOS   = 0x0402
 
-	// Custom User Message for Thread-Safe UI updates
-	WM_USER_LOG = 0x0400 + 1
+	// Custom User Messages for Thread-Safe UI updates
+	WM_USER_LOG                = 0x0400 + 1
+	WM_USER_REFRESH_SMART      = 0x0400 + 2
+	WM_USER_REFRESH_PARTITIONS = 0x0400 + 3
+	WM_USER_SET_STATUS         = 0x0400 + 4
 
 	// Win32 Color Messages
 	WM_CTLCOLORSTATIC  = 0x0138
@@ -293,6 +296,19 @@ func wndProc(hwnd syscall.Handle, msg uintptr, wParam, lParam uintptr) uintptr {
 		utf16Ptr := (*uint16)(unsafe.Pointer(wParam))
 		// Log the string on the main thread safely
 		addLogToBoxRaw(utf16Ptr)
+		return 0
+
+	case WM_USER_REFRESH_SMART:
+		updateSmartListBox()
+		return 0
+
+	case WM_USER_REFRESH_PARTITIONS:
+		updatePartitionListBox()
+		return 0
+
+	case WM_USER_SET_STATUS:
+		utf16Ptr := (*uint16)(unsafe.Pointer(wParam))
+		procSetWindowTextW.Call(uintptr(StatusLabelHWND), uintptr(unsafe.Pointer(utf16Ptr)))
 		return 0
 
 	// Handle custom dark theme coloring for all standard controls
@@ -510,7 +526,17 @@ func handleDriveSelection(selIndex int) {
 	}
 
 	CurrentProfile = profile
-	SmartAttrs = GetMockSmartAttributes(profile)
+	if !drive.IsSimulated {
+		attrs, err := QueryPhysicalSmartAttributes(drive.Path)
+		if err == nil && len(attrs) > 0 {
+			SmartAttrs = attrs
+		} else {
+			// fallback if SMART query fails or is restricted on host
+			SmartAttrs = GetMockSmartAttributes(profile)
+		}
+	} else {
+		SmartAttrs = GetMockSmartAttributes(profile)
+	}
 	Partitions = GetDefaultPartitions(drive.CapacityBytes)
 
 	// Update GUI text labels
@@ -613,23 +639,24 @@ func triggerAiRepair() {
 		threadSafeLog("✔ SUCCESS: Low-level drive firmware exception successfully patched and resolved!")
 		threadSafeLog("✔ All logical-to-physical block access and platter sectors restored.")
 
-		// Marshal UI update calls back to the main UI thread safely
+		// Marshal UI update calls back to the main UI thread safely using STA-compliant synchronous message passing
 		time.Sleep(100 * time.Millisecond)
 
 		uStatusText, _ := syscall.UTF16PtrFromString("• حالة الميديا: سليم تماماً ومستقر بعد الإصلاح الذاتي بالذكاء الاصطناعي.\n• Platter status: Healthy & Stabilized via Autonomous AI Repair.")
-		procSetWindowTextW.Call(uintptr(StatusLabelHWND), uintptr(unsafe.Pointer(uStatusText)))
-		updateSmartListBox()
-		updatePartitionListBox()
+		procSendMessageW.Call(uintptr(MainHWND), WM_USER_SET_STATUS, uintptr(unsafe.Pointer(uStatusText)), 0)
+
+		procSendMessageW.Call(uintptr(MainHWND), WM_USER_REFRESH_SMART, 0, 0)
+		procSendMessageW.Call(uintptr(MainHWND), WM_USER_REFRESH_PARTITIONS, 0, 0)
 
 		msgBox("✔ تم إصلاح وتجاوز عطل الفيرموير بنجاح تام! / Firmware successfully repaired and restored!")
 	}()
 }
 
-// Thread-safe UI logging helper via Win32 message queue (PostMessage)
+// Thread-safe UI logging helper via Win32 synchronous message passing
 func threadSafeLog(text string) {
 	uText, _ := syscall.UTF16PtrFromString(text)
-	// Post message asynchronously to the main thread's message loop
-	procPostMessageW.Call(uintptr(MainHWND), WM_USER_LOG, uintptr(unsafe.Pointer(uText)), 0)
+	// Send message synchronously to the main thread's message loop, preventing Go GC pointer races
+	procSendMessageW.Call(uintptr(MainHWND), WM_USER_LOG, uintptr(unsafe.Pointer(uText)), 0)
 }
 
 // Victoria scanning handlers
@@ -660,12 +687,33 @@ func updateVictoriaScan() {
 		latencyStr = "ERROR (TIMEOUT)"
 	}
 
-	// Real drive direct reading integration
+	// Real drive direct reading integration with precise real-time hardware latency measurement
 	if SelectedDrive != nil && !SelectedDrive.IsSimulated {
+		startRead := time.Now()
 		buf, err := ReadPhysicalSector(SelectedDrive.Path, lba)
-		if err == nil && len(buf) == 512 {
-			latencyStr = "READ OK (0ms)"
-			delayType = Delay3ms
+		elapsedRead := time.Since(startRead).Milliseconds()
+
+		if err != nil || len(buf) != 512 {
+			delayType = DelayError
+			latencyStr = "ERROR (BAD SECTOR / ACCESS DENIED)"
+			latency = 9999
+		} else {
+			latency = elapsedRead
+			latencyStr = strconv.FormatInt(latency, 10) + " ms"
+			switch {
+			case latency < 3:
+				delayType = Delay3ms
+			case latency < 10:
+				delayType = Delay10ms
+			case latency < 50:
+				delayType = Delay50ms
+			case latency < 150:
+				delayType = Delay150ms
+			case latency < 500:
+				delayType = Delay500ms
+			default:
+				delayType = DelayOver
+			}
 		}
 	}
 

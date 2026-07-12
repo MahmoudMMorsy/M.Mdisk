@@ -40,6 +40,8 @@ var (
 	procInvalidateRect   = user32.NewProc("InvalidateRect")
 	procSetTimer         = user32.NewProc("SetTimer")
 	procKillTimer        = user32.NewProc("KillTimer")
+	procBeginPaint       = user32.NewProc("BeginPaint")
+	procEndPaint         = user32.NewProc("EndPaint")
 
 	// gdi32 functions
 	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
@@ -51,6 +53,7 @@ var (
 	procSetTextColor     = gdi32.NewProc("SetTextColor")
 	procSetBkColor       = gdi32.NewProc("SetBkColor")
 	procCreateFontW      = gdi32.NewProc("CreateFontW")
+	procRectangle        = gdi32.NewProc("Rectangle")
 
 	// comctl32 functions
 	procInitCommonControlsEx = comctl32.NewProc("InitCommonControlsEx")
@@ -81,6 +84,32 @@ const (
 
 	// Custom User Message for Thread-Safe UI updates
 	WM_USER_LOG = 0x0400 + 1
+
+	// Win32 Color Messages
+	WM_CTLCOLORSTATIC  = 0x0138
+	WM_CTLCOLORLISTBOX = 0x0134
+	WM_CTLCOLOREDIT    = 0x0133
+)
+
+// RGB helper function
+func RGB(r, g, b byte) uint32 {
+	return uint32(r) | (uint32(g) << 8) | (uint32(b) << 16)
+}
+
+// Custom GDI Brushes & Colors matching the high-tech Compose app
+var (
+	ColorSlateDark = RGB(12, 16, 23)     // Deep background
+	ColorSlateCard = RGB(19, 26, 38)     // Card background
+	ColorPurple80  = RGB(216, 180, 254)  // Glowing purple
+	ColorNeonGreen = RGB(57, 255, 20)    // Glowing green
+	ColorNeonAmber = RGB(245, 158, 11)   // Orange warning
+	ColorNeonBlue  = RGB(59, 130, 246)   // Blue active
+	ColorNeonRed   = RGB(239, 68, 68)    // Red failure
+	ColorWhite     = RGB(255, 255, 255)
+	ColorTerminal  = RGB(57, 255, 20)    // Green text
+
+	BrushSlateDark syscall.Handle
+	BrushSlateCard syscall.Handle
 )
 
 // Global state variables
@@ -110,6 +139,9 @@ var (
 	CurrentProfile SmartProfile = HealthyHDD
 	CarvedFiles    []RecoveredFile
 
+	// Scanned blocks for Victoria Heatmap Grid
+	ScannedBlocks []BlockDetail
+
 	// Failure definitions initialized globally
 	DetectedFailures []DriveFailure = GetFailureDetails()
 
@@ -123,6 +155,7 @@ var (
 	VictoriaBtnHWND   syscall.Handle
 	VictoriaProgHWND  syscall.Handle
 	VictoriaHistHWND  syscall.Handle
+	VictoriaGridHWND  syscall.Handle // Custom drawing area for Victoria blocks
 	SpinRiteBtnHWND   syscall.Handle
 	SpinRiteWaveHWND  syscall.Handle
 	SpinRiteStatsHWND syscall.Handle
@@ -182,6 +215,12 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	InitializeVirtualDisk()
 
+	// Initialize background brushes
+	hBrushDark, _, _ := procCreateSolidBrush.Call(uintptr(ColorSlateDark))
+	BrushSlateDark = syscall.Handle(hBrushDark)
+	hBrushCard, _, _ := procCreateSolidBrush.Call(uintptr(ColorSlateCard))
+	BrushSlateCard = syscall.Handle(hBrushCard)
+
 	// Initialize Common Controls (Tab control, Progress Bar)
 	var icex initCommonControlsEx
 	icex.Size = uint32(unsafe.Sizeof(icex))
@@ -194,7 +233,7 @@ func main() {
 	wc.Size = uint32(unsafe.Sizeof(wc))
 	wc.WndProc = syscall.NewCallback(wndProc)
 	wc.Instance = 0
-	wc.Background = 5 // COLOR_WINDOW
+	wc.Background = BrushSlateDark // Modern Dark theme background brush!
 	wc.ClassName = className
 	_, _, _ = procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
@@ -255,6 +294,40 @@ func wndProc(hwnd syscall.Handle, msg uintptr, wParam, lParam uintptr) uintptr {
 		// Log the string on the main thread safely
 		addLogToBoxRaw(utf16Ptr)
 		return 0
+
+	// Handle custom dark theme coloring for all standard controls
+	case WM_CTLCOLORSTATIC:
+		hdc := syscall.Handle(wParam)
+		childHWND := syscall.Handle(lParam)
+
+		if childHWND == VictoriaGridHWND { // custom drawing for Victoria 2D Grid
+			procSetTextColor.Call(uintptr(hdc), uintptr(ColorTerminal))
+			procSetBkColor.Call(uintptr(hdc), uintptr(ColorSlateDark))
+			return uintptr(BrushSlateDark)
+		}
+
+		// Dark background for normal static labels
+		procSetTextColor.Call(uintptr(hdc), uintptr(ColorPurple80))
+		procSetBkColor.Call(uintptr(hdc), uintptr(ColorSlateDark))
+		return uintptr(BrushSlateDark)
+
+	case WM_CTLCOLORLISTBOX:
+		hdc := syscall.Handle(wParam)
+		procSetTextColor.Call(uintptr(hdc), uintptr(ColorTerminal))
+		procSetBkColor.Call(uintptr(hdc), uintptr(ColorSlateCard))
+		return uintptr(BrushSlateCard)
+
+	case WM_CTLCOLOREDIT:
+		hdc := syscall.Handle(wParam)
+		procSetTextColor.Call(uintptr(hdc), uintptr(ColorTerminal))
+		procSetBkColor.Call(uintptr(hdc), uintptr(ColorSlateCard))
+		return uintptr(BrushSlateCard)
+
+	case WM_PAINT:
+		// Draw Victoria 2D Heatmap Grid manually
+		if ActivePanelID == 2 { // Victoria Panel
+			drawVictoriaHeatmap()
+		}
 	}
 
 	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), msg, wParam, lParam)
@@ -275,25 +348,25 @@ func createUiControls(hwnd syscall.Handle) {
 	)
 	TabHWND = syscall.Handle(tabH)
 
-	// Add Tabs
-	addTabItem("1. AI Repair & Control / إصلاح ذكي", 0)
-	addTabItem("2. S.M.A.R.T. Health / فحص ذكي", 1)
-	addTabItem("3. Victoria Scanner / مسح الميديا", 2)
-	addTabItem("4. SpinRite Pulse / مغنطة الخلايا", 3)
-	addTabItem("5. Partition Magic / التقسيمات", 4)
-	addTabItem("6. Carver Recovery / استعادة داتا", 5)
+	// Add Tabs with Modern High-Tech labels
+	addTabItem("1. AI Control & Repair / الصيانة التلقائية", 0)
+	addTabItem("2. S.M.A.R.T. Attributes / مستشعرات القرص", 1)
+	addTabItem("3. Victoria Block Heatmap / مسح القطاعات", 2)
+	addTabItem("4. SpinRite Pulse / نبضات الاستقرار", 3)
+	addTabItem("5. Partition Magic / مدير تقسيم الملفات", 4)
+	addTabItem("6. Signature Carver Recovery / استعادة الداتا", 5)
 
-	// Panel 0 headers (always visible titles/background labels)
-	createStaticLabel(hwnd, "★ ACE LAB PC-3000 WINDOWS CORE UTILITY ★", 20, 45, 780, 25, 0)
+	// Static control for headers
+	createStaticLabel(hwnd, "★ ACE LAB PC-3000 WINDOWS HARDWARE WORKSTATION ★", 20, 45, 780, 25, 0)
 
 	// PANEL 1: AI Repair & Control
-	createStaticLabel(hwnd, "Select HDD Interface / حدد القرص المراد فحصه:", 30, 80, 400, 20, 1)
+	createStaticLabel(hwnd, "Select Target Device Interface / حدد واجهة التخزين الفيزيائية:", 30, 80, 400, 20, 1)
 	createComboBox(hwnd, 30, 105, 450, 200, 1, 1)
-	createStaticLabel(hwnd, "STATUS DIAGNOSTICS REGISTERS / تقييم صحة الميديا:", 30, 150, 450, 20, 1)
+	createStaticLabel(hwnd, "STATUS DIAGNOSTICS REGISTERS / تقييم صحة الميديا والمنطقة الخدمية:", 30, 150, 450, 20, 1)
 	StatusLabelHWND = createStaticLabel(hwnd, "• Drive Status: Standby / بانتظار تحديد القرص الصلب لتقييمه.", 30, 175, 450, 40, 1)
 	InfoLabelHWND = createStaticLabel(hwnd, "• Connection Type: Simulated Port Engine.", 30, 215, 450, 20, 1)
 
-	AiRepairBtnHWND = createButton(hwnd, "APPLY AI AUTO-REPAIR / تطبيق الصيانة التلقائية", 30, 260, 450, 40, 101, 1)
+	AiRepairBtnHWND = createButton(hwnd, "APPLY AUTONOMOUS AI DRIVE REPAIR / تطبيق الصيانة الفورية", 30, 260, 450, 40, 101, 1)
 	InfoBoxHWND = createEditBox(hwnd, "ACE Lab Novosibirsk Russia. Low-Level Firmware recovery console.", 30, 320, 450, 230, 102, 1)
 
 	// PANEL 2: S.M.A.R.T
@@ -302,9 +375,14 @@ func createUiControls(hwnd syscall.Handle) {
 
 	// PANEL 3: Victoria Scanner
 	createStaticLabel(hwnd, "Victoria Sector Latency block scan / فحص قطاعات القرص ببرنامج فيكتوريا:", 30, 80, 750, 20, 3)
-	VictoriaBtnHWND = createButton(hwnd, "START PLATER HEATMAP SCAN / بدء فحص قطاعات الميديا", 30, 110, 500, 40, 301, 3)
-	VictoriaProgHWND = createProgressBar(hwnd, 30, 160, 500, 25, 3)
-	VictoriaHistHWND = createListBox(hwnd, 30, 200, 750, 350, 302, 3)
+	VictoriaBtnHWND = createButton(hwnd, "START PLATER HEATMAP SCAN / بدء فحص قطاعات الميديا", 30, 110, 350, 40, 301, 3)
+	VictoriaProgHWND = createProgressBar(hwnd, 395, 118, 385, 25, 3)
+
+	// Dynamic 2D Heatmap Grid Display Canvas (Uses Static control as target context)
+	createStaticLabel(hwnd, "LIVE CLUSTER ANALYSIS PLOT (خريطة قطاعات الذاكرة التفاعلية):", 30, 160, 750, 20, 3)
+	VictoriaGridHWND = createStaticLabel(hwnd, "", 30, 185, 750, 150, 3)
+
+	VictoriaHistHWND = createListBox(hwnd, 30, 345, 750, 200, 302, 3)
 
 	// PANEL 4: SpinRite Pulse
 	createStaticLabel(hwnd, "SpinRite Magnetic Pulse Surface Recovery / نبضات استعدال المغنطة السطحية:", 30, 80, 750, 20, 4)
@@ -459,8 +537,12 @@ func handleDriveSelection(selIndex int) {
 	clearListBox(VictoriaHistHWND)
 	clearListBox(SpinRiteStatsHWND)
 	clearListBox(CarveListHWND)
+	ScannedBlocks = nil
 	procSendMessageW.Call(uintptr(VictoriaProgHWND), PBM_SETPOS, 0, 0)
 	procSendMessageW.Call(uintptr(PartWipeProgHWND), PBM_SETPOS, 0, 0)
+
+	// Force redraw of Victoria Grid
+	procInvalidateRect.Call(uintptr(VictoriaGridHWND), 0, 1)
 }
 
 func updateSmartListBox() {
@@ -556,6 +638,7 @@ func startVictoriaScan() {
 	addListBoxItem(VictoriaHistHWND, "  LBA Block Sector  | Delay Latency (ms)  | Platter Cell Speed")
 	addListBoxItem(VictoriaHistHWND, "  -------------------------------------------------------------")
 	ScanProgress = 0
+	ScannedBlocks = nil
 	procSetTimer.Call(uintptr(MainHWND), 1, 150, 0)
 }
 
@@ -586,8 +669,74 @@ func updateVictoriaScan() {
 		}
 	}
 
+	block := BlockDetail{LBA: lba, LatencyMs: latency, Type: delayType}
+	ScannedBlocks = append(ScannedBlocks, block)
+
 	line := fmt.Sprintf("  0x%08X        | %-20s | %s", lba, latencyStr, delayType)
 	addListBoxItem(VictoriaHistHWND, line)
+
+	// Force redraw of Victoria Grid to render the new square block
+	procInvalidateRect.Call(uintptr(VictoriaGridHWND), 0, 1)
+}
+
+// GDI Custom paint for Victoria Heatmap Grid
+func drawVictoriaHeatmap() {
+	hdc, _, _ := procGetDC.Call(uintptr(VictoriaGridHWND))
+	if hdc == 0 {
+		return
+	}
+	defer procReleaseDC.Call(uintptr(VictoriaGridHWND), hdc)
+
+	// Clear canvas to dark SlateDark background
+	var rc rect
+	procGetClientRect.Call(uintptr(VictoriaGridHWND), uintptr(unsafe.Pointer(&rc)))
+	procRectangle.Call(hdc, 0, 0, uintptr(rc.Right), uintptr(rc.Bottom))
+
+	// Draw beautiful grid blocks
+	blockWidth := int32(14)
+	blockHeight := int32(14)
+	spacing := int32(3)
+
+	cols := (rc.Right - spacing) / (blockWidth + spacing)
+	if cols <= 0 {
+		cols = 1
+	}
+
+	for idx, b := range ScannedBlocks {
+		col := int32(idx) % cols
+		row := int32(idx) / cols
+
+		x := spacing + col*(blockWidth+spacing)
+		y := spacing + row*(blockHeight+spacing)
+
+		// Choose high-fidelity color matching the delay type
+		var brushColor uint32
+		switch b.Type {
+		case Delay3ms:
+			brushColor = RGB(64, 64, 64)       // Dark Grey
+		case Delay10ms:
+			brushColor = RGB(160, 160, 160)    // Light Grey
+		case Delay50ms:
+			brushColor = RGB(57, 255, 20)      // Neon Green
+		case Delay150ms:
+			brushColor = RGB(245, 158, 11)     // Neon Amber
+		case Delay500ms:
+			brushColor = RGB(239, 68, 68)      // Red
+		case DelayOver:
+			brushColor = RGB(139, 92, 246)     // Purple
+		case DelayError:
+			brushColor = RGB(59, 130, 246)     // Neon Blue
+		default:
+			brushColor = RGB(64, 64, 64)
+		}
+
+		hBrush, _, _ := procCreateSolidBrush.Call(uintptr(brushColor))
+		if hBrush != 0 {
+			procSelectObject.Call(hdc, hBrush)
+			procRectangle.Call(hdc, uintptr(x), uintptr(y), uintptr(x+blockWidth), uintptr(y+blockHeight))
+			procDeleteObject.Call(hBrush)
+		}
+	}
 }
 
 // SpinRite Repair handlers

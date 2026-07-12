@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,7 +138,7 @@ func DeepScanFileCarver(path string, startLba int64, sectorCount int64, isSimula
 
 			// PNG Header Check: 89 50 4E 47
 			if bytes.Equal(data[0:4], []byte{0x89, 0x50, 0x4E, 0x47}) {
-				size := int64(1024) // tiny default size or read more
+				size := int64(1024)
 				content := make([]byte, size)
 				if isSimulated {
 					copy(content, VirtualDisk[lba*512:])
@@ -149,6 +148,14 @@ func DeepScanFileCarver(path string, startLba int64, sectorCount int64, isSimula
 						copy(content[sIdx*512:], sd)
 					}
 				}
+
+				// Professional file boundary detection: scan for standard PNG footer 'IEND' (\x49\x45\x4e\x44\xae\x42\x60\x82)
+				iendSig := []byte{0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82}
+				if idx := bytes.Index(content, iendSig); idx != -1 {
+					// Slice the PNG file perfectly up to the end checksum signature!
+					content = content[:idx+len(iendSig)]
+				}
+
 				files = append(files, RecoveredFile{
 					Name:       fmt.Sprintf("CARVED_LBA_%d.PNG", lba),
 					Type:       "PNG",
@@ -177,6 +184,14 @@ func DeepScanFileCarver(path string, startLba int64, sectorCount int64, isSimula
 						copy(content[sIdx*512:], sd)
 					}
 				}
+
+				// Slice ZIP at end directory signature for safety if present
+				zipEndSig := []byte{0x50, 0x4B, 0x05, 0x06}
+				if idx := bytes.Index(content, zipEndSig); idx != -1 {
+					// Add 18 bytes of directory footer offset
+					content = content[:idx+22]
+				}
+
 				files = append(files, RecoveredFile{
 					Name:       fmt.Sprintf("CARVED_LBA_%d.ZIP", lba),
 					Type:       "ZIP",
@@ -206,6 +221,13 @@ func DeepScanFileCarver(path string, startLba int64, sectorCount int64, isSimula
 						copy(content[sIdx*512:], sd)
 					}
 				}
+
+				// Find closing tag </html>
+				htmlEnd := []byte("</html>")
+				if idx := bytes.Index(bytes.ToLower(content), htmlEnd); idx != -1 {
+					content = content[:idx+len(htmlEnd)]
+				}
+
 				files = append(files, RecoveredFile{
 					Name:       fmt.Sprintf("CARVED_LBA_%d.HTML", lba),
 					Type:       "HTML",
@@ -270,10 +292,10 @@ func SaveFileToDisk(file RecoveredFile, destFolder string, arabic bool) string {
 	// Trim trailing null characters from raw bytes
 	contentToSave := bytes.TrimRight(file.RawContent, "\x00")
 
-	err := ioutil.WriteFile(target, contentToSave, 0666)
+	err := os.WriteFile(target, contentToSave, 0666)
 	if err != nil {
 		fallback := filepath.Join(".", file.Name)
-		_ = ioutil.WriteFile(fallback, contentToSave, 0666)
+		_ = os.WriteFile(fallback, contentToSave, 0666)
 		target = fallback
 	}
 

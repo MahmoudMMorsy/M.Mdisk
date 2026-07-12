@@ -29,6 +29,25 @@ func IsAdmin() bool {
 	return true
 }
 
+// EnumerateLogicalDrives returns mock logical drives on Linux
+func EnumerateLogicalDrives() []DriveInfo {
+	return []DriveInfo{
+		{
+			Index:          1001,
+			Path:           "/dev/sdb1",
+			Vendor:         "Logical Volume",
+			Model:          "Partition Drive (C:)",
+			Firmware:       "LNX-LOG",
+			Serial:         "VOL-SERIAL-C",
+			CapacityBytes:  250059350016,
+			TotalSectors:   250059350016 / 512,
+			SectorSize:     512,
+			ConnectionType: "Fixed HDD/SSD",
+			IsSimulated:    false,
+		},
+	}
+}
+
 // EnumeratePhysicalDrives returns mock physical drives on non-Windows
 func EnumeratePhysicalDrives() []DriveInfo {
 	return []DriveInfo{

@@ -153,15 +153,15 @@ func PrintPartitionTable(partitions []Partition, totalBytes int64, arabic bool) 
 	}
 }
 
-// ConvertMbrToGpt converts MBR to GPT safely on Windows using Microsoft-certified PowerShell commands under the hood
+// ConvertMbrToGpt converts MBR to GPT safely and losslessly on Windows using Microsoft-certified mbr2gpt.exe tool
 func ConvertMbrToGpt(diskIndex int, path string, isSimulated bool) error {
 	if isSimulated {
 		// Safe simulation writeback
 		return nil
 	}
 
-	// Call Microsoft PowerShell Initialize-Disk cmd natively to execute 100% safe, stable, and certified GPT conversion!
-	cmd := exec.Command("powershell", "-Command", fmt.Sprintf("Initialize-Disk -Number %d -PartitionStyle GPT -ErrorAction SilentlyContinue", diskIndex))
+	// Run lossless mbr2gpt.exe utility natively to convert without erasing user data
+	cmd := exec.Command("mbr2gpt.exe", "/convert", fmt.Sprintf("/disk:%d", diskIndex), "/allowFullOS")
 	return cmd.Run()
 }
 
@@ -185,73 +185,42 @@ func CloneDisk(srcPath, destPath string, totalSectors int64, isSimulated bool, p
 	if totalSectors <= 0 {
 		totalSectors = 2000000 // default 1GB fallback
 	}
-	chunkSize := int64(128)
-
-	for lba := int64(0); lba < totalSectors; lba += chunkSize {
-		if isSimulated {
+	if isSimulated {
+		chunkSize := int64(128)
+		for lba := int64(0); lba < totalSectors; lba += chunkSize {
 			buf := make([]byte, chunkSize*512)
 			if lba*512 < int64(len(VirtualDisk)) {
 				copy(buf, VirtualDisk[lba*512:])
 			}
-		} else {
-			// Real physical sector reading and writing cloned streams
-			for sIdx := int64(0); sIdx < chunkSize; sIdx++ {
-				data, err := ReadPhysicalSector(srcPath, lba+sIdx)
-				if err == nil && len(data) == 512 {
-					_ = WritePhysicalSector(destPath, lba+sIdx, data)
-				}
+			progress := (float64(lba+chunkSize) / float64(totalSectors)) * 100.0
+			if progress > 100.0 {
+				progress = 100.0
 			}
+			progressCallback(progress)
+			time.Sleep(10 * time.Millisecond) // simulation cloner delay
 		}
-
-		progress := (float64(lba+chunkSize) / float64(totalSectors)) * 100.0
-		if progress > 100.0 {
-			progress = 100.0
-		}
-		progressCallback(progress)
-		time.Sleep(30 * time.Millisecond) // cloner delay
+		progressCallback(100.0)
+		return nil
 	}
-	progressCallback(100.0)
-	return nil
+
+	return CloneDiskReal(srcPath, destPath, totalSectors, progressCallback)
 }
 
 // BackupDiskImage packages raw disk sectors into a backup .bin file on host
 func BackupDiskImage(srcPath, imageFilePath string, totalSectors int64, isSimulated bool, progressCallback func(float64)) error {
-	f, err := os.Create(imageFilePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	if totalSectors <= 0 {
 		totalSectors = 1000 // default mock backup bounds
 	}
-
-	for lba := int64(0); lba < totalSectors; lba++ {
-		var data []byte
-		if isSimulated {
-			if lba >= 0 && lba < 1000 {
-				data = VirtualDisk[lba*512 : (lba+1)*512]
-			} else {
-				data = make([]byte, 512)
-			}
-		} else {
-			data, _ = ReadPhysicalSector(srcPath, lba)
-			if len(data) != 512 {
-				data = make([]byte, 512)
-			}
+	if isSimulated {
+		for lba := int64(0); lba < totalSectors; lba++ {
+			progress := float64(lba+1) / float64(totalSectors) * 100.0
+			progressCallback(progress)
+			time.Sleep(2 * time.Millisecond) // simulation backup delay
 		}
-
-		_, err = f.Write(data)
-		if err != nil {
-			return err
-		}
-
-		progress := float64(lba+1) / float64(totalSectors) * 100.0
-		progressCallback(progress)
-		time.Sleep(5 * time.Millisecond) // backup stream delay
+		return nil
 	}
 
-	return nil
+	return BackupDiskImageReal(srcPath, imageFilePath, totalSectors, progressCallback)
 }
 
 // RestoreDiskImage restores raw sectors back from image file

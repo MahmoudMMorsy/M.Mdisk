@@ -220,6 +220,24 @@ type initCommonControlsEx struct {
 	ICC  uint32
 }
 
+// gridWndProc is the custom window procedure for the Victoria grid to ensure clean drawing and zero background flickering
+func gridWndProc(hwnd syscall.Handle, msg uintptr, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case WM_DESTROY:
+		return 0
+	case WM_PAINT:
+		var ps paintStruct
+		hdc, _, _ := procBeginPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
+		if hdc != 0 {
+			drawVictoriaHeatmap(syscall.Handle(hdc), hwnd)
+			procEndPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
+		}
+		return 0
+	}
+	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), msg, wParam, lParam)
+	return ret
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	InitializeVirtualDisk()
@@ -245,6 +263,16 @@ func main() {
 	wc.Background = BrushSlateDark // Modern Dark theme background brush!
 	wc.ClassName = className
 	_, _, _ = procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+
+	// Register Custom Grid Window Class
+	gridClassName, _ := syscall.UTF16PtrFromString("PC3000GridClass")
+	var gwc wndClassEx
+	gwc.Size = uint32(unsafe.Sizeof(gwc))
+	gwc.WndProc = syscall.NewCallback(gridWndProc)
+	gwc.Instance = 0
+	gwc.Background = BrushSlateDark
+	gwc.ClassName = gridClassName
+	_, _, _ = procRegisterClassExW.Call(uintptr(unsafe.Pointer(&gwc)))
 
 	// Create Main Window
 	titleStr := "★ EaseUS & PC-3000 All-in-One Professional Disk Diagnostics & Recovery Suite ★"
@@ -349,12 +377,6 @@ func wndProc(hwnd syscall.Handle, msg uintptr, wParam, lParam uintptr) uintptr {
 		procSetTextColor.Call(uintptr(hdc), uintptr(ColorTerminal))
 		procSetBkColor.Call(uintptr(hdc), uintptr(ColorSlateCard))
 		return uintptr(BrushSlateCard)
-
-	case WM_PAINT:
-		// Draw Victoria 2D Heatmap Grid manually
-		if ActivePanelID == 2 { // Victoria Panel
-			drawVictoriaHeatmap()
-		}
 	}
 
 	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), msg, wParam, lParam)
@@ -406,9 +428,9 @@ func createUiControls(hwnd syscall.Handle) {
 	VictoriaBtnHWND = createButton(hwnd, "START PLATER HEATMAP SCAN / بدء فحص قطاعات الميديا", 30, 110, 350, 40, 301, 3)
 	VictoriaProgHWND = createProgressBar(hwnd, 395, 118, 385, 25, 3)
 
-	// Dynamic 2D Heatmap Grid Display Canvas (Uses Static control as target context)
+	// Dynamic 2D Heatmap Grid Display Canvas (Uses Custom Window Class)
 	createStaticLabel(hwnd, "LIVE CLUSTER ANALYSIS PLOT (خريطة قطاعات الذاكرة التفاعلية):", 30, 160, 750, 20, 3)
-	VictoriaGridHWND = createStaticLabel(hwnd, "", 30, 185, 750, 150, 3)
+	VictoriaGridHWND = createCustomGridControl(hwnd, 30, 185, 750, 150, 3)
 
 	VictoriaHistHWND = createListBox(hwnd, 30, 345, 750, 200, 302, 3)
 
@@ -819,17 +841,17 @@ func updateVictoriaScan() {
 }
 
 // GDI Custom paint for Victoria Heatmap Grid
-func drawVictoriaHeatmap() {
-	hdc, _, _ := procGetDC.Call(uintptr(VictoriaGridHWND))
-	if hdc == 0 {
-		return
-	}
-	defer procReleaseDC.Call(uintptr(VictoriaGridHWND), hdc)
-
+func drawVictoriaHeatmap(hdc syscall.Handle, gridHWND syscall.Handle) {
 	// Clear canvas to dark SlateDark background
 	var rc rect
-	procGetClientRect.Call(uintptr(VictoriaGridHWND), uintptr(unsafe.Pointer(&rc)))
-	procRectangle.Call(hdc, 0, 0, uintptr(rc.Right), uintptr(rc.Bottom))
+	procGetClientRect.Call(uintptr(gridHWND), uintptr(unsafe.Pointer(&rc)))
+
+	hBrushBg, _, _ := procCreateSolidBrush.Call(uintptr(ColorSlateDark))
+	if hBrushBg != 0 {
+		procSelectObject.Call(uintptr(hdc), hBrushBg)
+		procRectangle.Call(uintptr(hdc), 0, 0, uintptr(rc.Right), uintptr(rc.Bottom))
+		procDeleteObject.Call(hBrushBg)
+	}
 
 	// Draw beautiful grid blocks
 	blockWidth := int32(14)
@@ -871,8 +893,8 @@ func drawVictoriaHeatmap() {
 
 		hBrush, _, _ := procCreateSolidBrush.Call(uintptr(brushColor))
 		if hBrush != 0 {
-			procSelectObject.Call(hdc, hBrush)
-			procRectangle.Call(hdc, uintptr(x), uintptr(y), uintptr(x+blockWidth), uintptr(y+blockHeight))
+			procSelectObject.Call(uintptr(hdc), hBrush)
+			procRectangle.Call(uintptr(hdc), uintptr(x), uintptr(y), uintptr(x+blockWidth), uintptr(y+blockHeight))
 			procDeleteObject.Call(hBrush)
 		}
 	}
@@ -1019,6 +1041,22 @@ func saveCarvedFile() {
 }
 
 // Win32 Helper functions to make UI creation simple
+func createCustomGridControl(parent syscall.Handle, x, y, w, h int, panelID int) syscall.Handle {
+	class, _ := syscall.UTF16PtrFromString("PC3000GridClass")
+	hwndChild, _, _ := procCreateWindowExW.Call(
+		0,
+		uintptr(unsafe.Pointer(class)),
+		0,
+		WS_CHILD|WS_VISIBLE,
+		uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		uintptr(parent),
+		0, 0, 0,
+	)
+	hCtrl := syscall.Handle(hwndChild)
+	PanelControls[panelID] = append(PanelControls[panelID], hCtrl)
+	return hCtrl
+}
+
 func createStaticLabel(parent syscall.Handle, text string, x, y, w, h int, panelID int) syscall.Handle {
 	class, _ := syscall.UTF16PtrFromString("STATIC")
 	uText, _ := syscall.UTF16PtrFromString(text)
@@ -1133,6 +1171,16 @@ func populateDrivePresets() {
 		DrivesList = append(DrivesList, drive)
 
 		displayLabel := fmt.Sprintf("\\\\.\\PhysicalDrive%d - Real Disk [%s]", drive.Index, FormatSize(drive.CapacityBytes))
+		uName, _ := syscall.UTF16PtrFromString(displayLabel)
+		procSendMessageW.Call(uintptr(DriveComboHWND), 0x0143, 0, uintptr(unsafe.Pointer(uName))) // CB_ADDSTRING
+	}
+
+	// Next, scan and append actual logical drives (partitions/volumes) from Windows
+	logicalDrives := EnumerateLogicalDrives()
+	for _, drive := range logicalDrives {
+		DrivesList = append(DrivesList, drive)
+
+		displayLabel := fmt.Sprintf("%s - Real Partition [%s]", drive.Path, FormatSize(drive.CapacityBytes))
 		uName, _ := syscall.UTF16PtrFromString(displayLabel)
 		procSendMessageW.Call(uintptr(DriveComboHWND), 0x0143, 0, uintptr(unsafe.Pointer(uName))) // CB_ADDSTRING
 	}

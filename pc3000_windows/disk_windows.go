@@ -31,7 +31,25 @@ type DriveInfo struct {
 var (
 	shell32           = syscall.NewLazyDLL("shell32.dll")
 	procIsUserAnAdmin = shell32.NewProc("IsUserAnAdmin")
+
+	procGetLogicalDriveStringsW = kernel32.NewProc("GetLogicalDriveStringsW")
+	procGetDriveTypeW        = kernel32.NewProc("GetDriveTypeW")
+	procGetDiskFreeSpaceExW  = kernel32.NewProc("GetDiskFreeSpaceExW")
 )
+
+type diskGeometry struct {
+	Cylinders         int64
+	MediaType         int32
+	TracksPerCylinder uint32
+	SectorsPerTrack   uint32
+	BytesPerSector    uint32
+}
+
+type diskGeometryEx struct {
+	Geometry diskGeometry
+	DiskSize int64
+	Data     [1]byte
+}
 
 // IsAdmin checks if the current process has Administrator privileges on Windows using shell32.dll
 func IsAdmin() bool {
@@ -100,6 +118,87 @@ type SENDCMDOUTPARAMS struct {
 	BufferSize  uint32
 	DriverStatus [4]byte
 	Buffer       [512]byte
+}
+
+// EnumerateLogicalDrives retrieves all active drive letters (C:\, D:\, etc.) with actual capacities and drive types
+func EnumerateLogicalDrives() []DriveInfo {
+	var drives []DriveInfo
+
+	buffer := make([]uint16, 256)
+	ret, _, _ := procGetLogicalDriveStringsW.Call(uintptr(len(buffer)), uintptr(unsafe.Pointer(&buffer[0])))
+	if ret == 0 {
+		return drives
+	}
+
+	// Parse null-terminated strings
+	var driveLetters []string
+	curr := 0
+	for i := 0; i < int(ret); i++ {
+		if buffer[i] == 0 {
+			if i > curr {
+				driveLetters = append(driveLetters, string(utf16ToRunes(buffer[curr:i])))
+			}
+			curr = i + 1
+		}
+	}
+
+	for idx, letter := range driveLetters {
+		uLetter, err := syscall.UTF16PtrFromString(letter)
+		if err != nil {
+			continue
+		}
+
+		// Get drive type (e.g. DRIVE_FIXED = 3, DRIVE_REMOVABLE = 2, DRIVE_CDROM = 5)
+		driveType, _, _ := procGetDriveTypeW.Call(uintptr(unsafe.Pointer(uLetter)))
+
+		typeStr := "Fixed HDD/SSD"
+		if driveType == 2 {
+			typeStr = "Removable USB Flash"
+		} else if driveType == 5 {
+			typeStr = "CD-ROM Drive"
+		} else if driveType == 4 {
+			typeStr = "Network Drive"
+		}
+
+		// Get drive capacity
+		var freeBytesAvailable, totalNumberOfBytes, totalNumberOfFreeBytes int64
+		_, _, _ = procGetDiskFreeSpaceExW.Call(
+			uintptr(unsafe.Pointer(uLetter)),
+			uintptr(unsafe.Pointer(&freeBytesAvailable)),
+			uintptr(unsafe.Pointer(&totalNumberOfBytes)),
+			uintptr(unsafe.Pointer(&totalNumberOfFreeBytes)),
+		)
+
+		if totalNumberOfBytes <= 0 {
+			continue // skip empty drives / card readers without media
+		}
+
+		path := fmt.Sprintf("\\\\.\\%s", strings.TrimSuffix(letter, "\\"))
+
+		drives = append(drives, DriveInfo{
+			Index:          idx + 1000,
+			Path:           path,
+			Vendor:         "Logical Volume",
+			Model:          fmt.Sprintf("Partition Drive (%s)", strings.TrimSuffix(letter, "\\")),
+			Firmware:       "WIN-LOG",
+			Serial:         fmt.Sprintf("VOL-SERIAL-%s", strings.TrimSuffix(letter, ":\\")),
+			CapacityBytes:  totalNumberOfBytes,
+			TotalSectors:   totalNumberOfBytes / 512,
+			SectorSize:     512,
+			ConnectionType: typeStr,
+			IsSimulated:    false,
+		})
+	}
+
+	return drives
+}
+
+func utf16ToRunes(s []uint16) []rune {
+	r := make([]rune, len(s))
+	for i, v := range s {
+		r[i] = rune(v)
+	}
+	return r
 }
 
 // EnumeratePhysicalDrives checks for active PhysicalDrive paths and queries their properties natively
@@ -383,21 +482,6 @@ func GetSmartAttributeName(id int) string {
 	}
 }
 
-// Disk Geometry structures for IOCTL
-type diskGeometry struct {
-	Cylinders         int64
-	MediaType         int32
-	TracksPerCylinder uint32
-	SectorsPerTrack   uint32
-	BytesPerSector    uint32
-}
-
-type diskGeometryEx struct {
-	Geometry diskGeometry
-	DiskSize int64
-	Data     [1]byte
-}
-
 // ReadPhysicalSector reads a 512-byte block from a real physical Windows drive
 func ReadPhysicalSector(path string, lba int64) ([]byte, error) {
 	utfPath, err := syscall.UTF16PtrFromString(path)
@@ -480,5 +564,166 @@ func WritePhysicalSector(path string, lba int64, data []byte) error {
 		return fmt.Errorf("write error on LBA %d: %v", lba, err)
 	}
 
+	return nil
+}
+
+// CloneDiskReal performs a high-performance raw disk-to-disk or disk-to-file clone by opening handles once and using buffered block I/O
+func CloneDiskReal(srcPath, destPath string, totalSectors int64, progressCallback func(float64)) error {
+	utfSrc, err := syscall.UTF16PtrFromString(srcPath)
+	if err != nil {
+		return err
+	}
+	utfDest, err := syscall.UTF16PtrFromString(destPath)
+	if err != nil {
+		return err
+	}
+
+	// Open source handle once
+	hSrc, err := syscall.CreateFile(
+		utfSrc,
+		syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		syscall.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to open source drive: %v", err)
+	}
+	defer syscall.CloseHandle(hSrc)
+
+	// Open destination handle once. Use CREATE_ALWAYS to support creating files if they do not exist
+	creationDisposition := uint32(syscall.OPEN_EXISTING)
+	if !strings.HasPrefix(destPath, "\\\\.\\") {
+		creationDisposition = syscall.CREATE_ALWAYS
+	}
+	hDest, err := syscall.CreateFile(
+		utfDest,
+		syscall.GENERIC_WRITE,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		creationDisposition,
+		0,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to open destination: %v", err)
+	}
+	defer syscall.CloseHandle(hDest)
+
+	// Block size: 128 sectors (64 KB)
+	sectorsPerBlock := int64(128)
+	bufferSize := sectorsPerBlock * 512
+	buffer := make([]byte, bufferSize)
+
+	for lba := int64(0); lba < totalSectors; lba += sectorsPerBlock {
+		if lba+sectorsPerBlock > totalSectors {
+			sectorsPerBlock = totalSectors - lba
+			bufferSize = sectorsPerBlock * 512
+			buffer = buffer[:bufferSize]
+		}
+
+		// Read block
+		var bytesRead uint32
+		err = syscall.ReadFile(hSrc, buffer, &bytesRead, nil)
+		if err != nil {
+			break
+		}
+		if bytesRead == 0 {
+			break
+		}
+
+		// Write block
+		var bytesWritten uint32
+		err = syscall.WriteFile(hDest, buffer[:bytesRead], &bytesWritten, nil)
+		if err != nil {
+			break
+		}
+
+		progress := (float64(lba+sectorsPerBlock) / float64(totalSectors)) * 100.0
+		if progress > 100.0 {
+			progress = 100.0
+		}
+		progressCallback(progress)
+	}
+
+	progressCallback(100.0)
+	return nil
+}
+
+// BackupDiskImageReal performs a high-performance single-handle buffered sector backup to a .bin file
+func BackupDiskImageReal(srcPath, imageFilePath string, totalSectors int64, progressCallback func(float64)) error {
+	utfSrc, err := syscall.UTF16PtrFromString(srcPath)
+	if err != nil {
+		return err
+	}
+	utfDest, err := syscall.UTF16PtrFromString(imageFilePath)
+	if err != nil {
+		return err
+	}
+
+	hSrc, err := syscall.CreateFile(
+		utfSrc,
+		syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		syscall.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to open source drive: %v", err)
+	}
+	defer syscall.CloseHandle(hSrc)
+
+	hDest, err := syscall.CreateFile(
+		utfDest,
+		syscall.GENERIC_WRITE,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		syscall.CREATE_ALWAYS, // Ensure file creation/overwrite
+		0,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create backup file: %v", err)
+	}
+	defer syscall.CloseHandle(hDest)
+
+	sectorsPerBlock := int64(128)
+	bufferSize := sectorsPerBlock * 512
+	buffer := make([]byte, bufferSize)
+
+	for lba := int64(0); lba < totalSectors; lba += sectorsPerBlock {
+		if lba+sectorsPerBlock > totalSectors {
+			sectorsPerBlock = totalSectors - lba
+			bufferSize = sectorsPerBlock * 512
+			buffer = buffer[:bufferSize]
+		}
+
+		var bytesRead uint32
+		err = syscall.ReadFile(hSrc, buffer, &bytesRead, nil)
+		if err != nil {
+			break
+		}
+		if bytesRead == 0 {
+			break
+		}
+
+		var bytesWritten uint32
+		err = syscall.WriteFile(hDest, buffer[:bytesRead], &bytesWritten, nil)
+		if err != nil {
+			break
+		}
+
+		progress := (float64(lba+sectorsPerBlock) / float64(totalSectors)) * 100.0
+		if progress > 100.0 {
+			progress = 100.0
+		}
+		progressCallback(progress)
+	}
+
+	progressCallback(100.0)
 	return nil
 }

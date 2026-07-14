@@ -6,7 +6,6 @@ package main
 import (
 	"fmt"
 	"math/rand"
-	"os"
 	"strconv"
 	"syscall"
 	"time"
@@ -89,6 +88,10 @@ var (
 	MainHWND       syscall.Handle
 	TabHWND        syscall.Handle
 	ActivePanelID  int = 0
+	SelectedDrive  *DriveInfo
+	ActiveFailure  *DriveFailure
+	Partitions     []Partition
+	SmartAttrs     []SmartAttribute
 	PulseHistory   []int
 	WipeProgress   int = 0
 	ScanProgress   int = 0
@@ -98,8 +101,17 @@ var (
 	OscilloscopeX  int = 0
 
 	// Track control handles for each panel to dynamically toggle show/hide and avoid overlaps
-	PanelControls [9][]syscall.Handle
+	PanelControls [7][]syscall.Handle
 
+	// Real and Simulated Drives Lists
+	DrivesList []DriveInfo
+
+	// Dynamic Drive Profile state
+	CurrentProfile SmartProfile = HealthyHDD
+	CarvedFiles    []RecoveredFile
+
+	// Failure definitions initialized globally
+	DetectedFailures []DriveFailure = GetFailureDetails()
 
 	// UI controls
 	DriveComboHWND    syscall.Handle
@@ -121,12 +133,6 @@ var (
 	CarveBtnHWND      syscall.Handle
 	CarveListHWND     syscall.Handle
 	SaveCarvedBtnHWND syscall.Handle
-	ImagerListHWND    syscall.Handle
-	FwSaListHWND      syscall.Handle
-
-	// Imager simulation controls
-	ImagerTimer uintptr
-	ImagerLBA   int64
 
 	// Arabic / English Toggle
 	ArabicMode bool = true
@@ -175,14 +181,6 @@ type initCommonControlsEx struct {
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	InitializeVirtualDisk()
-
-	// Check if CLI flags are passed
-	for _, arg := range os.Args {
-		if arg == "--cli" || arg == "-cli" || arg == "-c" || arg == "/cli" {
-			RunCLIMode()
-			return
-		}
-	}
 
 	// Initialize Common Controls (Tab control, Progress Bar)
 	var icex initCommonControlsEx
@@ -284,8 +282,6 @@ func createUiControls(hwnd syscall.Handle) {
 	addTabItem("4. SpinRite Pulse / مغنطة الخلايا", 3)
 	addTabItem("5. Partition Magic / التقسيمات", 4)
 	addTabItem("6. Carver Recovery / استعادة داتا", 5)
-	addTabItem("7. Advanced Imager / الاستنساخ", 6)
-	addTabItem("8. Firmware & Boot / الفيرموير", 7)
 
 	// Panel 0 headers (always visible titles/background labels)
 	createStaticLabel(hwnd, "★ ACE LAB PC-3000 WINDOWS CORE UTILITY ★", 20, 45, 780, 25, 0)
@@ -318,40 +314,16 @@ func createUiControls(hwnd syscall.Handle) {
 
 	// PANEL 5: Partition Magic
 	createStaticLabel(hwnd, "Partition Magic Volume Manager / جدول وتفاصيل تقسيمات الهارد ديسك الحالية:", 30, 80, 750, 20, 5)
-	PartListHWND = createListBox(hwnd, 30, 110, 750, 180, 501, 5)
-
-	// Advanced Partition Action buttons
-	createButton(hwnd, "Create Partition / إنشاء قسم", 30, 300, 180, 30, 510, 5)
-	createButton(hwnd, "Delete Partition / حذف قسم", 220, 300, 180, 30, 511, 5)
-	createButton(hwnd, "Resize Partition / تغيير حجم قسم", 410, 300, 180, 30, 512, 5)
-	createButton(hwnd, "Rebuild Partition Table (MBR/GPT)", 600, 300, 180, 30, 513, 5)
-
-	PartFormatBtnHWND = createButton(hwnd, "Format Partition (NTFS/FAT32)", 30, 350, 230, 35, 502, 5)
-	PartWipeBtnHWND = createButton(hwnd, "Secure Zero-Wipe Volume", 280, 350, 230, 35, 503, 5)
-	PartWipeProgHWND = createProgressBar(hwnd, 30, 400, 480, 25, 5)
+	PartListHWND = createListBox(hwnd, 30, 110, 750, 260, 501, 5)
+	PartFormatBtnHWND = createButton(hwnd, "Format Partition (NTFS/FAT32)", 30, 390, 230, 35, 502, 5)
+	PartWipeBtnHWND = createButton(hwnd, "Secure Zero-Wipe Volume", 280, 390, 230, 35, 503, 5)
+	PartWipeProgHWND = createProgressBar(hwnd, 30, 440, 480, 25, 5)
 
 	// PANEL 6: Carver Recovery
 	createStaticLabel(hwnd, "Deep File signature carver / استعادة الملفات المحذوفة بالتوقيع الرقمي:", 30, 80, 750, 20, 6)
 	CarveBtnHWND = createButton(hwnd, "RUN DEEP SECTOR CARVER / فحص واستعادة الملفات والبارتشنات", 30, 110, 500, 40, 601, 6)
 	CarveListHWND = createListBox(hwnd, 30, 165, 750, 330, 602, 6)
 	SaveCarvedBtnHWND = createButton(hwnd, "SAVE RECOVERED FILE / حفظ الملف المسترجع على الكمبيوتر", 30, 510, 500, 35, 603, 6)
-
-	// PANEL 7: Advanced Imager (Sector Cloner)
-	createStaticLabel(hwnd, "Advanced Physical Imager Engine / استنساخ قطاعات القرص الصلب وتجاوز العيوب:", 30, 80, 750, 20, 7)
-	createStaticLabel(hwnd, "Settings / الإعدادات: Direction: Reverse, Timeout: 2500ms, Bad Sector Skip: Yes.", 30, 110, 750, 20, 7)
-	createButton(hwnd, "START CLONING PROCESS / بدء عملية الاستنساخ", 30, 140, 350, 40, 701, 7)
-	createButton(hwnd, "HALT CLONING / إيقاف مؤقت", 390, 140, 350, 40, 702, 7)
-	createStaticLabel(hwnd, "Active Cloning Progress & Log Monitor:", 30, 195, 750, 20, 7)
-	ImagerListHWND = createListBox(hwnd, 30, 220, 750, 320, 703, 7)
-
-	// PANEL 8: Firmware SA & Boot Maintenance
-	createStaticLabel(hwnd, "Firmware Service Area & Boot Maintenance / صيانة مناطق الخدمة والإقلاع:", 30, 80, 750, 20, 8)
-	createButton(hwnd, "Reset Busy / LED State / إلغاء تجميد الهارد ديسك", 30, 120, 350, 35, 801, 8)
-	createButton(hwnd, "ATA / SCSI Security Erase / مسح أمن نهائي", 390, 120, 350, 35, 802, 8)
-	createButton(hwnd, "Patch ROM Head Map / تعطيل الرؤوس التالفة بروم", 30, 170, 350, 35, 803, 8)
-	createButton(hwnd, "Reconstruct Boot Records / إصلاح ملفات إقلاع الويندوز", 390, 170, 350, 35, 804, 8)
-	createStaticLabel(hwnd, "Service Area (SA) Modules Directory Integrity Map:", 30, 215, 750, 20, 8)
-	FwSaListHWND = createListBox(hwnd, 30, 240, 750, 300, 805, 8)
 
 	// Populate disk presets
 	populateDrivePresets()
@@ -360,7 +332,7 @@ func createUiControls(hwnd syscall.Handle) {
 
 func switchPanel(panelID int) {
 	ActivePanelID = panelID
-	for i := 1; i <= 8; i++ {
+	for i := 1; i <= 6; i++ {
 		showPanelControls(i, i == panelID+1)
 	}
 }
@@ -387,116 +359,6 @@ func handleCommand(wParam, lParam uintptr) {
 	}
 
 	switch controlID {
-	case 801: // RESET BUSY
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		msgBox("✔ تم إلغاء تجميد الهارد ديسك وتصفير سجل الـ Busy بنجاح تام! / Controller Busy & LED:000000CC State reset successfully.")
-
-	case 802: // SECURITY ERASE
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		msgBox("✔ تم إرسال أمر المسح الآمن (ATA Security Erase) لجميع كتل الخلايا! / ATA Security Erase process executed.")
-
-	case 803: // PATCH ROM HEAD MAP
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		FlashRomChip([]int{0, 1, 3}, true) // Bypass Head 2
-		msgBox("✔ تم تعطيل الرؤوس التالفة وكتابة خريطة الرؤوس الجديدة بالروم بنجاح! / Rom Head Map patched successfully.")
-
-	case 804: // RECONSTRUCT BOOT RECORDS
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		msgBox("✔ تم إعادة بناء وإصلاح ملفات الإقلاع الرئيسية ونظام MBR/GPT بنجاح! / Windows Boot Records reconstructed successfully.")
-
-	case 701: // START CLONING
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		clearListBox(ImagerListHWND)
-		addListBoxItem(ImagerListHWND, "  LBA Index       | Imaging Strategy       | Read Timeout | Sector Status")
-		addListBoxItem(ImagerListHWND, "  -------------------------------------------------------------------------")
-		ImagerLBA = 1000
-		procSetTimer.Call(uintptr(MainHWND), 4, 150, 0)
-
-	case 702: // HALT CLONING
-		procKillTimer.Call(uintptr(MainHWND), 4)
-		msgBox("✔ تم إيقاف عملية الاستنساخ مؤقتاً! / Imaging process halted.")
-	case 510: // CREATE PARTITION
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		var err error
-		Partitions, err = CreateNewPartition(Partitions, "NEW_VOLUME", "NTFS", 20480) // Create a 20GB partition
-		if err == nil {
-			updatePartitionListBox()
-			msgBox("✔ تم إنشاء القسم الجديد بنجاح! / Partition created successfully!")
-		} else {
-			msgBox("[-] خطأ: " + err.Error())
-		}
-
-	case 511: // DELETE PARTITION
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		curSel, _, _ := procSendMessageW.Call(uintptr(PartListHWND), 0x0188, 0, 0) // LB_GETCURSEL
-		if int(curSel) < 2 {
-			msgBox("يرجى اختيار القسم المراد حذفه من القائمة! / Please select partition.")
-			return
-		}
-		partIdx := int(curSel) - 2
-		if partIdx >= 0 && partIdx < len(Partitions) {
-			partID := Partitions[partIdx].ID
-			var err error
-			Partitions, err = DeletePartition(Partitions, partID)
-			if err == nil {
-				updatePartitionListBox()
-				msgBox("✔ تم حذف القسم المختار بنجاح! / Partition deleted successfully!")
-			} else {
-				msgBox("[-] خطأ: " + err.Error())
-			}
-		}
-
-	case 512: // RESIZE PARTITION
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		curSel, _, _ := procSendMessageW.Call(uintptr(PartListHWND), 0x0188, 0, 0) // LB_GETCURSEL
-		if int(curSel) < 2 {
-			msgBox("يرجى اختيار القسم المراد تغيير حجمه! / Please select partition.")
-			return
-		}
-		partIdx := int(curSel) - 2
-		if partIdx >= 0 && partIdx < len(Partitions) {
-			if Partitions[partIdx].IsUnallocated {
-				msgBox("لا يمكن تغيير حجم مساحة فارغة! / Cannot resize unallocated space.")
-				return
-			}
-			Partitions[partIdx].SizeBytes = Partitions[partIdx].SizeBytes / 2 // Halve size for simulation
-			updatePartitionListBox()
-			msgBox("✔ تم تقليص حجم القسم المحدد بنجاح! / Partition resized successfully!")
-		}
-
-	case 513: // REBUILD PARTITION TABLE
-		if SelectedDrive == nil {
-			msgBox("يرجى اختيار قرص صلب أولاً! / Please select a drive.")
-			return
-		}
-		Partitions = ScanPartitionsTestDisk(SelectedDrive.Path, SelectedDrive.IsSimulated, true)
-		updatePartitionListBox()
-		msgBox("✔ تم إعادة بناء وإصلاح جدول تقسيمات الهارد ديسك التالف بنجاح! / Partition table successfully rebuilt!")
-
 	case 101: // APPLY AI AUTO-REPAIR
 		if SelectedDrive == nil {
 			msgBox("يرجى اختيار قرص صلب أولاً لتقييمه وإصلاحه! / Please select a drive first.")
@@ -543,8 +405,6 @@ func handleTimer(wParam uintptr) {
 		updateSpinRiteWave()
 	} else if wParam == 3 { // Wipe Timer
 		updateWipeProgress()
-	} else if wParam == 4 { // Imager Timer
-		updateImagerProgress()
 	}
 }
 
@@ -595,27 +455,12 @@ func handleDriveSelection(selIndex int) {
 	// Update Partitions Listbox
 	updatePartitionListBox()
 
-	// Update Firmware Modules listbox
-	updateFwSaListBox()
-
 	// Clear scanner grids
 	clearListBox(VictoriaHistHWND)
 	clearListBox(SpinRiteStatsHWND)
 	clearListBox(CarveListHWND)
-	clearListBox(ImagerListHWND)
 	procSendMessageW.Call(uintptr(VictoriaProgHWND), PBM_SETPOS, 0, 0)
 	procSendMessageW.Call(uintptr(PartWipeProgHWND), PBM_SETPOS, 0, 0)
-}
-
-func updateFwSaListBox() {
-	clearListBox(FwSaListHWND)
-	addListBoxItem(FwSaListHWND, "  ID   | Firmware Module Name             | Size (Sect) | SA Location  | Status")
-	addListBoxItem(FwSaListHWND, "  -------------------------------------------------------------------------------")
-	state := InitializeLowLevelSA()
-	for _, m := range state.Modules {
-		line := fmt.Sprintf("  %-4s | %-32s | %-11d | %-12s | %s", m.ID, m.Name, m.SizeSectors, m.Cylinder, m.Status)
-		addListBoxItem(FwSaListHWND, line)
-	}
 }
 
 func updateSmartListBox() {
@@ -822,28 +667,6 @@ func updateWipeProgress() {
 		return
 	}
 	procSendMessageW.Call(uintptr(PartWipeProgHWND), PBM_SETPOS, uintptr(WipeProgress), 0)
-}
-
-func updateImagerProgress() {
-	ImagerLBA += 128
-	if ImagerLBA > 3000 {
-		procKillTimer.Call(uintptr(MainHWND), 4)
-		msgBox("✔ تم الانتهاء من استنساخ ونقل قطاعات القرص بنجاح تام! / Disk cloning completed successfully!")
-		return
-	}
-
-	strategy := "Reverse (Safe Platter)"
-	timeout := "2500 ms"
-	status := "SUCCESS"
-
-	if ImagerLBA%512 == 0 {
-		strategy = "Skip (Bad Sector)"
-		timeout = "2500 ms (TRIGGERED)"
-		status = "SKIPPED"
-	}
-
-	line := fmt.Sprintf("  0x%08X        | %-22s | %-12s | %s", ImagerLBA, strategy, timeout, status)
-	addListBoxItem(ImagerListHWND, line)
 }
 
 // Carver handlers
